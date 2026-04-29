@@ -1755,6 +1755,22 @@ Batch {batch_id} of changes:
 
     # ─────────────────────────────────────────────────────────────────────────
 
+    def _changelog_looks_broken(self, file_body: str, changes_lines: int) -> Optional[str]:
+        """Heuristic validator for generated changelogs.
+
+        Returns None if the body looks OK, or a short reason string if it
+        appears to be a summary/outline rather than a real changelog body.
+        """
+        body = (file_body or "").strip()
+        if not body:
+            return "empty file"
+        if len(body) < 200:
+            return f"body too short ({len(body)} chars)"
+        section_headings = sum(1 for line in body.splitlines() if line.startswith("## "))
+        if section_headings < 1:
+            return "no '## ' section headings"
+        return None
+
     def generate_changelog(self, version_str: str, iteration: int = 1) -> bool:
         """Generate changelog for a specific version. Returns True on success."""
         # Use the appropriate diff file based on iteration
@@ -1864,27 +1880,109 @@ Read the file `{rel}` to see added/removed string literals between versions
 message changes, new settings, or renamed features.
 """)
 
-            cli_prompt = "".join(cli_prompt_parts)
+            # Tell the agent to write the changelog to a specific path itself.
+            # This avoids the "last assistant message wins" failure mode where
+            # a wrap-up summary overwrites the real body in ResultMessage.result.
+            rel_changelog = changelog_file.relative_to(self.base_dir)
+            output_instructions = f"""
+
+## Output Instructions (CRITICAL)
+
+Write the COMPLETE changelog to the file `{rel_changelog}` using the Write tool.
+
+- Begin the file with `# Changelog for version {version_str}` followed by a blank line.
+- Then produce the FULL changelog body: per-feature `## Section` headings with
+  explanations, examples, and evidence as described in the system prompt.
+- Do NOT write a summary, outline, or "here are the key changes" overview —
+  write the complete document.
+- After calling the Write tool, your final assistant message should be a brief
+  confirmation only (e.g. "Wrote changelog to {rel_changelog}"). Do not echo
+  the changelog body back in your final message.
+"""
+            base_cli_prompt = "".join(cli_prompt_parts) + output_instructions
+
+            # How many lines of input did the agent get? Used by the validator
+            # to scale the minimum-output-size heuristic.
+            try:
+                changes_lines = (
+                    sum(1 for _ in open(filtered_diff_path, "r", encoding="utf-8"))
+                    if filtered_diff_path else 0
+                )
+            except Exception:
+                changes_lines = 0
 
             try:
                 from claude_agent_sdk import ClaudeAgentOptions
 
                 options = ClaudeAgentOptions(
                     system_prompt=system_prompt,
-                    allowed_tools=["Read", "Glob", "Grep"],
+                    allowed_tools=["Read", "Glob", "Grep", "Write"],
                     permission_mode="bypassPermissions",
                     cwd=str(self.base_dir),
                     env={"CLAUDE_CONFIG_DIR": str(_get_isolated_claude_config())},
                 )
-                changelog_content = self._run_query(cli_prompt, options)
+
+                cli_prompt = base_cli_prompt
+                last_reason = None
+                changelog_content = ""
+                file_body = ""
+                for attempt in (1, 2):
+                    # Pre-clear the target file so we can detect whether the
+                    # agent actually wrote to it on this attempt.
+                    changelog_file.unlink(missing_ok=True)
+
+                    changelog_content = self._run_query(cli_prompt, options)
+
+                    # Prefer the file the agent wrote; fall back to the result
+                    # text if the agent ignored the Write instruction.
+                    if changelog_file.exists():
+                        try:
+                            file_body = changelog_file.read_text(encoding="utf-8")
+                        except Exception:
+                            file_body = ""
+                    else:
+                        file_body = ""
+
+                    if not file_body.strip() and changelog_content.strip():
+                        # Agent didn't use Write — recover the result text.
+                        with open(changelog_file, "w", encoding="utf-8") as f:
+                            if not changelog_content.lstrip().startswith("# "):
+                                f.write(f"# Changelog for version {version_str}\n\n")
+                            f.write(changelog_content)
+                        file_body = changelog_file.read_text(encoding="utf-8")
+
+                    last_reason = self._changelog_looks_broken(file_body, changes_lines)
+                    if not last_reason:
+                        break
+
+                    print_warning(
+                        f"Changelog v{version_str} attempt {attempt} failed validation: {last_reason}"
+                    )
+                    if attempt == 2:
+                        break
+
+                    # Strengthen the prompt for the retry attempt.
+                    cli_prompt = base_cli_prompt + f"""
+
+## RETRY — previous attempt was rejected
+
+Your previous output was rejected by the validator. Reason: {last_reason}
+
+Do NOT produce a summary, an outline, or an overview. Read the diff files
+fully (use Read with offset/limit if needed), then call the Write tool to
+write the COMPLETE changelog to `{rel_changelog}`. The file must contain
+multiple `## ` section headings with full per-feature explanations.
+"""
             except Exception as e:
                 print_warning(f"Claude SDK execution failed: {e}")
                 return False
 
-            # Write changelog
-            with open(changelog_file, "w", encoding="utf-8") as f:
-                f.write(f"# Changelog for version {version_str}\n\n")
-                f.write(changelog_content)
+            if last_reason:
+                print_warning(
+                    f"Changelog v{version_str} still broken after retry ({last_reason}); "
+                    "leaving file in place but skipping cleanup/post"
+                )
+                return False
 
             print_success(f"Generated changelog for v{version_str}")
 
@@ -2919,8 +3017,9 @@ Examples:
 
     parser.add_argument(
         "--annotate",
-        action="store_true",
-        help="Run Haiku pre-annotation pass before changelog generation (hybrid mode: annotations + diffs)",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run Haiku pre-annotation pass before changelog generation (hybrid mode: annotations + diffs). Default: disabled (expensive; hundreds of Haiku calls per version). Use --annotate to enable.",
     )
 
     parser.add_argument(
