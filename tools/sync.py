@@ -310,12 +310,26 @@ class ClaudeCodeSync:
         print_info(f"Fetching all available releases from {self.project.github_repo}...")
 
         try:
-            # Use GitHub API to get releases
-            api_url = f"https://api.github.com/repos/{self.project.github_repo}/releases"
-            response = requests.get(api_url)
-            response.raise_for_status()
-
-            releases = response.json()
+            # Use GitHub API to get releases.  Paginate explicitly — the default
+            # page size is 30, which silently truncates repos like openai/codex
+            # that have hundreds of releases (mostly prereleases that get
+            # filtered out below, hiding the issue further).
+            releases = []
+            page = 1
+            while True:
+                api_url = (
+                    f"https://api.github.com/repos/{self.project.github_repo}"
+                    f"/releases?per_page=100&page={page}"
+                )
+                response = requests.get(api_url)
+                response.raise_for_status()
+                page_data = response.json()
+                if not page_data:
+                    break
+                releases.extend(page_data)
+                if len(page_data) < 100:
+                    break
+                page += 1
 
             # Extract version numbers from tag names, excluding pre-releases
             versions = []
