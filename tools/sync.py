@@ -1103,6 +1103,13 @@ class ClaudeCodeSync:
         Generate a string diff for a version using the AST-based string_diff.js tool.
         Returns the diff output as a string, or None if it fails.
         """
+        # string_diff.js parses minified JavaScript via Acorn.  Projects without
+        # a pretty/ directory (i.e. GitHub-based source projects like codex) have
+        # nothing for it to chew on; the fallback path below would dereference
+        # self.pretty_dir which is None for those, raising a TypeError.
+        if self.pretty_dir is None:
+            return None
+
         # Find the string_diff.js tool - it's in the same directory as this script
         tools_dir = Path(__file__).parent
         string_diff_tool = tools_dir / "string_diff.js"
@@ -1832,12 +1839,14 @@ Batch {batch_id} of changes:
                 with open(string_diff_path, "w", encoding="utf-8") as f:
                     f.write(string_diff_output)
 
-            if not filtered_diff_path and not string_diff_path:
-                print_warning(
-                    f"No filtered diff or string diff available for {version_str}. "
-                    "Skipping changelog generation."
-                )
-                return False
+            # When no pre-processed input is available (e.g. GitHub-based
+            # projects like codex with use_astdiff=False and no pretty/ dir),
+            # fall back to feeding the raw diff file directly.  The agent can
+            # Read it page by page; the system prompt tells it how to interpret
+            # unified diff output.
+            raw_diff_fallback = (
+                not filtered_diff_path and not string_diff_path
+            )
 
             # Run Haiku annotation pre-pass if requested (hybrid mode)
             annotation_summary = None
@@ -1892,6 +1901,19 @@ feature detection. Use the Read tool with offset/limit if the file is large.
 Read the file `{rel}` to see added/removed string literals between versions
 (identifiers and code fragments filtered). Use this to identify user-facing
 message changes, new settings, or renamed features.
+""")
+
+            if raw_diff_fallback:
+                rel = diff_file.relative_to(self.base_dir)
+                cli_prompt_parts.append(f"""
+
+## Code Changes (Raw Unified Diff)
+
+Read the file `{rel}` to see code changes between versions in unified diff
+format (`diff -u` output, or `git diff` for GitHub-based projects).  No noise
+filtering has been applied — focus on substantive code changes and skip
+formatting-only or version-bump hunks.  Use the Read tool with offset/limit
+if the file is large.
 """)
 
             # Tell the agent to write the changelog to a specific path itself.
