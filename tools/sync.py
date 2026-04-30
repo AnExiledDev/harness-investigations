@@ -89,6 +89,7 @@ class ProjectConfig:
         webhook_env_var: Optional[str] = None,
         source_subdir: Optional[str] = None,
         extract_files: Optional[List[Tuple[str, str]]] = None,
+        min_version: Optional[str] = None,
     ):
         self.name = name
         self.npm_package = npm_package
@@ -99,6 +100,8 @@ class ProjectConfig:
         self.changes_prompt = changes_prompt
         self.webhook_env_var = webhook_env_var
         self.source_subdir = source_subdir  # Subdirectory containing main source (e.g., "codex-rs")
+        # Floor for backfilling; acts as an implicit --since when none is given.
+        self.min_version = min_version
         # Files to extract: list of (archive_path, output_prefix) tuples
         # e.g., [("cli.js", "cli"), ("sdk.mjs", "sdk")] -> cli-v1.0.0.js, sdk-v1.0.0.mjs
         # If None, defaults to [("cli.js", "cli"), ("cli.mjs", "cli")] for backwards compat
@@ -154,6 +157,7 @@ PROJECTS = {
         source_subdir="codex-rs",  # Main Rust source is in codex-rs/
         use_astdiff=False,  # Regular diff for Rust source
         webhook_env_var="DISCORD_WEBHOOK_URL_CODEX",  # Separate webhook for Codex
+        min_version="0.116.0",  # Don't backfill older versions
     ),
 }
 
@@ -223,7 +227,10 @@ class ClaudeCodeSync:
         self.do_cleanup = cleanup
         self.post = post
         self.latest = latest
-        self.since = since
+        # Fall back to the project's min_version floor if no explicit --since.
+        # An explicit --since (even one older than the floor) wins, so ad-hoc
+        # work can still reach below the floor without editing config.
+        self.since = since if since is not None else project.min_version
         self.new_first = new_first
         self.redo = redo
         self.dry_run = dry_run

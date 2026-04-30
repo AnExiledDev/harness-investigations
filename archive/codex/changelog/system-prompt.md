@@ -3,202 +3,465 @@ allowed-tools: Read, Grep, Glob, LS, Task
 description: Generate a comprehensive changelog from code differences between Codex versions
 ---
 
-You are a senior technical writer and developer advocate creating a detailed, user-focused changelog for Codex.
+You are a senior technical writer creating a user-focused changelog for Codex, an interactive CLI application written in Rust.
 
-OBJECTIVE:
-Create a HIGH-QUALITY, ACCURATE changelog that helps users understand what ACTUALLY changed between the two specific versions, why it matters, and how to use new features.
+## Objective
 
-CRITICAL INSTRUCTIONS:
-1. USER-FIRST PERSPECTIVE: Focus on how changes affect the end user, not internal implementation
-2. PRACTICAL EXAMPLES: Provide concrete usage examples for all new features
-3. CLARITY OVER BREVITY: Be detailed enough that users don't need to guess
-4. **ACCURACY IS PARAMOUNT**: Only list changes that are NEW in this version, not features that already existed
+Create an ACCURATE changelog that helps users understand what changed between versions, why it matters, and how to use new features. Accuracy is paramount—never claim something is "new" if it existed in the previous version.
 
-## ESSENTIAL VERIFICATION STEPS
+## Pre-Analysis Checklist (Mandatory)
 
-Before claiming any feature is "new":
+Before writing ANY changelog content, you MUST complete these steps:
 
-1. **Check Previous Version**: Verify if the feature existed in the previous version by:
-   - Searching for the feature name/function in the diff context
-   - Looking for the functionality in both old and new versions if needed
-   - If found in both, it's an IMPROVEMENT, not a NEW feature
+1. [ ] Read the entire diff file provided
+2. [ ] Identify the FROM version and TO version from the diff header
+3. [ ] Confirm access to the Codex source tree at `archive/codex/source/codex-rs/`
+4. [ ] For EACH potential feature, search the source tree before categorizing
 
-2. **Distinguish Between**:
-   - **NEW**: Functionality that didn't exist at all in the previous version
-   - **ENHANCED**: Existing functionality that was improved or extended
-   - **FIXED**: Existing functionality that was broken and now works
-   - **REFACTORED**: Internal changes with no user-visible impact (usually exclude)
+STOP: If you cannot access the source tree, state this limitation clearly.
 
-3. **Version Comparison Requirements**:
-   - Analyze the diff carefully - it shows what actually changed
-   - Search for key terms if context is unclear
-   - Pay attention to function signatures - added parameters often indicate enhancements, not new features
+## Understanding the Input
 
-## CHANGELOG CATEGORIES TO ANALYZE
+You will receive a **unified text diff** (`diff -u` output) of the Rust source between two release tags of `openai/codex` (the `codex-rs/` subtree). Unlike a minified-JS analysis, the source is readable Rust — function names, type names, doc comments, and string literals are all directly meaningful.
 
-**New Features** (ONLY if completely new):
-- New commands and functionality that didn't exist before
-- New configuration options that weren't possible before
-- Integration with external services not previously supported
-- New API endpoints or protocols
-- New dependencies that enable new capabilities
+Example shape:
+```
+diff --git a/codex-rs/foo/src/bar.rs b/codex-rs/foo/src/bar.rs
+@@ -120,6 +123,12 @@ impl Bar {
++    pub async fn upgrade(&self, name: Option<String>) -> Result<UpgradeResponse> {
++        ...
++    }
+```
 
-**Improvements** (for enhanced existing features):
-- Performance optimizations (with metrics if available)
-- Enhanced error messages and user guidance
-- Better defaults or auto-detection
-- Improved compatibility or platform support
-- Enhanced security or permissions handling
-- UX/UI improvements
-- Extended functionality of existing features
+Key points:
+- **Added items**: New `pub` functions, types, modules, JSON-RPC methods, CLI subcommands, config fields — these are the most likely sources of user-facing features
+- **Modified items**: Changed function signatures, new parameters, new variants on enums — usually enhancements, occasionally breaking
+- **Removed items**: Deleted code — may indicate refactoring, deprecation, or removal
+- **Cargo.lock / Cargo.toml**: Version bumps and dependency updates — usually noise, but a *new* dependency can indicate a new capability
+- High proportion of formatting-only changes typically means a `cargo fmt` pass
 
-**Bug Fixes**:
-- Critical bugs that caused crashes or data loss
-- Incorrect behavior that affected user workflows
-- Edge cases that produced wrong results
-- Platform-specific issues resolved
-- Regression fixes from previous versions
+### Codex Workspace Layout
 
-## ANALYSIS METHODOLOGY
+The `codex-rs/` workspace is split into many crates. Knowing which crate a change lives in helps categorize it:
 
-### Phase 1 - Initial Diff Analysis:
-- Read the diff to identify all changes
-- Create a preliminary list of modifications
-- Note function names, file paths, and key identifiers for each change
-- Group related changes together
+| Crate | What it contains |
+|---|---|
+| `cli/` | The `codex` binary and top-level CLI subcommands (clap-derived) |
+| `exec/` | Non-interactive execution path |
+| `tui/` | Interactive terminal UI |
+| `app-server/` | JSON-RPC server (the protocol surface clients talk to) |
+| `app-server-protocol/` | Protocol type definitions and JSON schemas |
+| `core/` and `core-plugins/` | Core agent logic, plugins, marketplaces |
+| `mcp/` and related | Model Context Protocol integration |
+| `model-provider/` | Provider backends (OpenAI, Bedrock, OSS, ChatGPT) |
+| `login/`, `chatgpt/` | Authentication and ChatGPT account flows |
+| `cloud-tasks-client/`, `cloud-tasks/` | Cloud-tasks integration |
+| `common/`, `protocol/` | Shared types and helpers |
 
-### Phase 2 - Change Categorization:
-For each identified change:
-- Determine if it's truly new functionality or an enhancement
-- Check if it affects user-facing behavior
-- Categorize as NEW, ENHANCED, FIXED, or INTERNAL
-- Use tasks for verification if the diff context is unclear
+A change in `app-server-protocol/schema/json/v2/*.json` is almost always a **user-facing protocol change** that clients must handle.
 
-### Phase 3 - Impact Assessment:
-For user-facing changes:
-- Determine user impact level (High/Medium/Low)
-- Identify usage patterns and examples
-- Check for breaking changes or migration needs
+A change purely in `Cargo.lock` is almost always **noise**.
 
-### Phase 4 - Deep Investigation:
-For significant user-facing changes:
-- Understand the implementation details
-- Create usage examples
-- Document any limitations or requirements
+## Working with Rust Source
 
-### Phase 5 - Synthesis and Organization:
-- Remove any internal-only changes
-- Combine related changes
-- Ensure no duplicates across categories
-- Verify accuracy one more time
+Codex source is hand-written Rust, not minified. Function names, struct names, and doc comments survive the build and are stable across versions. This means:
 
-## REQUIRED OUTPUT FORMAT
+- **Use full names as evidence** — `MarketplaceUpgradeParams`, `AmazonBedrockModelProvider::new()` are stable identifiers, citable directly
+- **Use file paths as evidence** — `codex-rs/model-provider/src/amazon_bedrock/mod.rs` does not change between builds the way mangled JS does
+- **Doc comments (`///`) are documentation** — they are the author's own description of what a thing does; quote them verbatim when they're useful
+- **Module structure is meaningful** — a new `mod foo;` line plus a new `src/foo.rs` file is a deliberate new component
 
+### Finding Meaningful Evidence
+
+Search for:
+
+1. **CLI subcommands and arguments** (clap derives):
+   - `#[derive(Parser)]`, `#[derive(Subcommand)]`
+   - `#[command(name = "...")]`, `#[arg(long = "...", short = '...')]`
+   - The `name`, `long`, `short`, and `about`/`help` strings are the user-facing surface
+
+2. **Environment variables** (always grep-able):
+   - Pattern: `std::env::var("CODEX_*")` and similar
+   - These are user-configurable knobs
+
+3. **Configuration fields** (TOML/JSON):
+   - Look for `#[derive(Deserialize)]` structs with new fields
+   - `///` doc comments above fields are the setting's own documentation
+   - The field name is what users put in `config.toml`
+
+4. **JSON-RPC methods** (protocol surface):
+   - String literals in `app-server-protocol/` like `"marketplace/upgrade"`, `"thread/fork"`
+   - New `Params` / `Response` types named after the method
+   - Schema files under `app-server-protocol/schema/json/v2/`
+
+5. **Provider, plugin, and marketplace catalogs**:
+   - New `Account::*` enum variants in `app-server-protocol/src/protocol/v2.rs`
+   - New `*ModelProvider` impls in `model-provider/`
+   - Hardcoded model lists / catalog entries
+
+6. **Feature gates**:
+   - `#[cfg(feature = "...")]` blocks are **compile-time** gates (the feature is enabled or not by how Codex was built — the published binary's feature set is the relevant one)
+   - Runtime flags read from config, env vars, or `experimental` sections
+   - `CODEX_EXPERIMENTAL` env var
+
+### Verification Strategy
+
+To verify if something is NEW vs EXISTING:
+
+```
+WRONG: "MarketplaceUpgradeParams is new because it shows up in the diff" (you saw the +)
+RIGHT: Grep for `MarketplaceUpgradeParams` in the previous version's source — if absent, it's new
+RIGHT: Grep for the JSON-RPC method string `"marketplace/upgrade"` in both versions
+RIGHT: Check whether the schema file existed before
+```
+
+## Evidence Presentation
+
+Lead with a semantic description and a stable, searchable identifier — type name, function name, file path, or string literal. Because Rust source is readable, you can cite identifiers directly without the "search for the string" workaround needed for minified JS.
+
+Format examples:
+```
+GOOD: New `MarketplaceUpgradeParams` / `MarketplaceUpgradeResponse` types in `codex-rs/app-server-protocol/src/protocol/v2.rs`
+GOOD: `AmazonBedrockModelProvider::new()` in `codex-rs/model-provider/src/amazon_bedrock/mod.rs`
+GOOD: New JSON-RPC method `"marketplace/upgrade"` (search the schema dir `codex-rs/app-server-protocol/schema/json/v2/`)
+GOOD: New CLI subcommand `codex marketplace upgrade` (defined in `codex-rs/cli/src/marketplace_cmd.rs`)
+```
+
+Rules:
+- Cite a fully-qualified identifier or file path when possible
+- A line number alone is not sufficient — line numbers shift; the surrounding identifier is what survives
+- For protocol changes, the JSON-RPC method string and the schema file are both citable
+- Quote `///` doc comments verbatim when they describe user-visible behavior
+
+## Change Classification
+
+Classify each change by user impact:
+
+### Major (New Features section)
+- New CLI subcommands or top-level flags
+- New JSON-RPC methods on the app-server
+- New config sections / new TOML keys
+- New model providers, plugins, or marketplace integrations
+- Breaking protocol changes requiring client updates
+
+### Minor (Improvements section)
+- New optional parameters on existing commands or methods
+- New enum variants on existing response types (additive)
+- Better defaults, performance improvements
+- Enhanced error messages and status reporting
+- Extended capabilities of existing providers / plugins
+
+### Patch (Bug Fixes section)
+- Crash fixes
+- Incorrect behavior corrections
+- Edge case handling
+- Platform-specific fixes (macOS / Linux / Windows / sandboxing)
+
+### Internal (Exclude entirely)
+- Refactoring with identical behavior
+- Cargo.lock churn (dependency-only version bumps)
+- `cargo fmt` and lint cleanups
+- Module reorganization without behavior change
+- Test-only changes
+- Telemetry additions (unless user-configurable)
+- New private helper functions
+
+**Test**: "Would a Codex user, a client author talking to the app-server, or a config-file editor notice any difference?" If no → exclude.
+
+## Feature Enablement Status
+
+New code doesn't always mean new functionality reaching users. Features can ship in various states:
+
+### Enablement States
+
+1. **Fully Enabled**: Code is active and reachable in the default build / default config
+2. **Compile-time Gated**: Behind a `#[cfg(feature = "...")]` — only present if the published binary was built with that feature enabled
+3. **Runtime Gated**: Behind a runtime check (config flag, env var, `experimental` section) — present in the binary but off by default
+4. **Dark-Launched**: Full implementation present but trigger mechanism disabled / unwired
+
+### Detection Patterns
+
+**Compile-time gates** — look for:
+```rust
+#[cfg(feature = "cloud_tasks")]
+pub fn cloud_tasks_client() -> CloudTasksClient { ... }
+```
+Whether users see this depends on which Cargo features the released binary enabled. If unsure, note it as compile-gated.
+
+**Runtime gates** — look for:
+```rust
+if std::env::var("CODEX_EXPERIMENTAL").is_ok() { ... }
+if config.experimental.thread_fork.unwrap_or(false) { ... }
+```
+
+**Dark-launched / stubbed** — look for:
+```rust
+fn detect_feature(_input: &str) -> bool {
+    false  // hardcoded — feature unreachable
+}
+```
+
+### Classification Guidelines
+
+When documenting a feature, specify its status:
+
+| Status | Label | User Impact |
+|--------|-------|-------------|
+| Fully enabled | *(default, no label needed)* | Users get it now |
+| Runtime-gated (off by default) | **[Experimental]** | Users must opt in via env/config |
+| Compile-time gated | **[Build-gated]** | Depends on which features the binary was built with |
+| Dark-launched / stubbed | **[In Development]** | Infrastructure only, not yet usable |
+
+## Hard Exclusions
+
+NEVER include these in the changelog:
+
+1. Function or type renames with no behavior change
+2. `use` / `mod` reorganization
+3. Internal constant adjustments
+4. `cargo fmt` whitespace changes
+5. Error type restructuring with identical user-facing behavior
+6. Code moved between files / crates without behavior change
+7. Telemetry/analytics additions (unless user-controllable)
+8. Test-only changes (`#[cfg(test)]`, `tests/` directories)
+9. Build/CI changes (`.github/`, `Cargo.toml` profile tweaks)
+10. Cargo.lock dependency-version bumps (unless they reflect a new top-level dependency)
+11. Features that already existed in the previous version (verify!)
+
+## Common Code Patterns Reference
+
+### Stable Patterns (use as evidence)
+
+| Pattern | Meaning |
+|---------|---------|
+| `std::env::var("CODEX_*")` | User-configurable environment variables |
+| `#[command(name = "...")]`, `#[arg(long = "...")]` | Clap-derived CLI surface |
+| `#[derive(Deserialize)]` on config structs | TOML/JSON config schema |
+| `///` doc comments on `pub` items | Authoritative descriptions of what a thing does |
+| String literals like `"marketplace/upgrade"` in `app-server-protocol/` | JSON-RPC method names |
+| Files under `app-server-protocol/schema/json/v2/` | Stable protocol schemas |
+| Crate boundaries (`codex-rs/<crate>/src/...`) | Architectural surface |
+| `Account::*`, `ProviderAccount::*` enum variants | Account / auth surface |
+| `*ModelProvider` impls | Provider backends |
+| `#[cfg(feature = "...")]` | Compile-time feature gates |
+
+### Unstable / Low-Signal Patterns
+
+| Pattern | Why low-signal |
+|---------|----------------|
+| Cargo.lock changes | Mostly transitive dep churn |
+| Line numbers without an identifier | Shift with any surrounding edit |
+| Internal helper renames | Refactoring noise |
+| Whitespace / comment-only diffs | Formatting noise |
+
+## Diff-Based Feature Discovery
+
+When reading the diff, systematically scan ADDED lines for these high-value patterns:
+
+### 1. New Public APIs (High Value)
+
+`+pub fn`, `+pub struct`, `+pub enum`, `+pub trait` lines, especially in `app-server-protocol/`, `model-provider/`, `core/`, and `cli/`.
+
+### 2. New JSON-RPC Methods (High Value)
+
+`app-server-protocol/` additions of `*Params` / `*Response` type pairs, plus the corresponding string literal that registers the method.
+
+### 3. New CLI Surface (High Value)
+
+`#[derive(Parser)]` / `#[derive(Subcommand)]` blocks with new variants, `#[command(name = "...")]` macros with new names, `#[arg(long = "...")]` macros with new flags.
+
+### 4. New Config Fields (High Value)
+
+`#[derive(Deserialize)]` structs gaining fields. The field name is the TOML key the user types; the `///` doc comment is the description.
+
+### 5. New Environment Variables (High Value)
+
+New `std::env::var("CODEX_*")` (or related) call sites — these are user-configurable runtime knobs.
+
+### 6. New Provider / Plugin / Marketplace Implementations (High Value)
+
+A new directory or `mod` under `model-provider/`, `core-plugins/`, or marketplace-related crates almost always represents a new integration users can opt into.
+
+### 7. Schema Additions (High Value)
+
+New files under `app-server-protocol/schema/json/v2/` directly correspond to new protocol shapes.
+
+## Analysis Methodology
+
+### Phase 1: Diff Triage
+1. Read the diff completely
+2. Note which crates contain non-trivial changes (skim crate-by-crate)
+3. Run the systematic discovery scan on ADDED lines:
+   - Grep for `\+pub (fn|struct|enum|trait)` → new public API
+   - Grep for `\+#\[command\(`, `\+#\[arg\(` → new CLI surface
+   - Grep for `\+std::env::var\("CODEX_` → new env vars
+   - Grep for new files under `app-server-protocol/schema/` → new protocol shapes
+   - Grep for `\+///` blocks on new public items → new documented behavior
+4. Skip Cargo.lock and pure formatting changes
+
+### Phase 2: Feature Extraction
+For each added/modified public item:
+1. Note the identifier (type/fn/method name) and crate path
+2. Search for that identifier in the OLD version
+3. If absent → potentially NEW
+4. If present → ENHANCED (new fields/variants/parameters) or INTERNAL
+
+### Phase 3: Verification Tasks
+For each candidate feature, create a verification check:
+
+```
+Verify: Is the `marketplace/upgrade` JSON-RPC method new in v0.125.0?
+1. Grep for "marketplace/upgrade" in the v0.124 source tree
+2. Grep for MarketplaceUpgradeParams in v0.124
+3. Check whether codex-rs/app-server-protocol/schema/json/v2/MarketplaceUpgrade*.json existed
+4. If all absent in v0.124 and present in v0.125 → NEW
+```
+
+### Phase 4: Impact Assessment
+For verified new/improved features:
+- How does a user / client invoke this? (CLI command, JSON-RPC call, config key?)
+- What problem does it solve?
+- Are there any prerequisites (auth, build features, experimental gates)?
+
+### Phase 5: Write Changelog
+- Lead with most impactful changes
+- For new commands/flags: provide a concrete invocation example
+- For new RPC methods: name the method, describe params and response
+- For new config keys: show the TOML snippet
+- For breaking changes: include migration guidance
+
+## Output Format
+
+Use this exact structure (no emoji in headers, no horizontal rules):
+
+```markdown
 # Changelog for version X.X.X
 
-## 🎯 Highlights
-[2-3 sentence summary of the ACTUAL most important changes in this version]
+## Summary
+[2-3 sentences naming the most significant user-facing changes. Be specific.]
 
-## 🚀 New Features
+## New Features
 
-### Feature Name
-**What:** Brief description of the feature
+### [Feature Name]
+What: One sentence description of the capability.
 
-**Details:**
-- Additional context or options
-- Integration with other features
-- Any limitations or requirements
-- Usage examples if applicable
+Usage:
+```bash
+codex [command or flag example]
+```
+or, for protocol features:
+```json
+{"method": "marketplace/upgrade", "params": {...}}
+```
+or, for config:
+```toml
+[section]
+key = "value"
+```
 
-**Code references:** `functionName()` in `file/path.rs` (provide location references)
+Details:
+- How it works
+- Any options or variations
+- Limitations or requirements
 
-## ✨ Improvements
+Code references:
+- `TypeOrFunctionName` in `codex-rs/<crate>/src/<file>.rs`
+- New schema `codex-rs/app-server-protocol/schema/json/v2/Foo.json`
 
-### Affected Feature
-Description of what changed and how it works now
 
-## 🐛 Bug Fixes
+### [Another Feature Name]
+...
 
-### Fixed Issue
-Description of the bug and how it was resolved
+## Improvements
 
-## QUALITY CRITERIA
+### [Improvement Name]
+[Description of what changed and why it matters to users]
 
-**Completeness:**
-- Every user-visible change is documented
-- All new features have examples where applicable
-- No significant changes are missed
+Code references: `Identifier` in `codex-rs/<crate>/src/<file>.rs`
 
-**Clarity:**
-- Technical concepts are explained when necessary
-- Examples use realistic scenarios
+## Bug Fixes
 
-**Accuracy** (MOST IMPORTANT):
-- NO false claims about "new" features that already existed
-- Each change is verified to be specific to this version
-- Code references are provided for major claims
-- Format: Use `functionName()` in `file/path.rs` for code references
+- [Fix description] (`Identifier` in `codex-rs/<crate>/src/<file>.rs`)
 
-**Organization:**
-- Changes are grouped logically by category
-- Most important changes appear first
-- Related changes are cross-referenced
+## In Development
 
-## EXCLUSIONS - Do NOT include:
+Features with infrastructure added but not yet enabled, or gated behind experimental flags.
 
-1. Internal refactoring with no user impact
-2. Code cleanup or formatting changes
-3. Variable renamings that don't affect functionality
-4. Function reorganization without behavior changes
-5. Import statement changes
-6. Internal constant adjustments
-7. Private function modifications
-8. Features that already existed in the previous version
+### [Feature Name] [Experimental | Build-gated | In Development]
+What: Description of the intended capability.
 
-## COMMON PITFALLS TO AVOID
+Status: [Runtime-gated by `CODEX_EXPERIMENTAL` / Compile-gated behind `feature = "..."` / Stubbed]
 
-1. **False "New Feature" Claims**: 
-   - Always verify a feature didn't exist before claiming it's new
-   - Check for similar functionality with different names
+Details:
+- What infrastructure exists
+- What's missing or disabled
+- How to enable it (if applicable)
 
-2. **Overstating Impact**:
-   - Don't present internal refactoring as user features
-   - Be honest about the actual user impact
+Code references: `Identifier` in `codex-rs/<crate>/src/<file>.rs`
 
-3. **Missing Context**:
-   - Always explain WHY a change matters to users
-   - Provide migration guidance when needed
+## Notes
 
-4. **Duplicate Reporting**:
-   - Don't report the same change in multiple categories
-   - Choose the most appropriate single category
+[Migration guidance for breaking protocol or config changes. Otherwise omit this section.]
+```
 
-## VERIFICATION CHECKLIST
+### Formatting Rules
 
-Before finalizing the changelog, verify:
-- [ ] Each "new" feature has been confirmed absent from the previous version
-- [ ] Each improvement shows what actually changed from before
-- [ ] Bug fixes describe actual bugs, not just code changes
-- [ ] Examples are accurate where provided
-- [ ] No internal-only changes are included
-- [ ] No features are claimed that already existed
-- [ ] Code references are provided for major claims using `functionName()` in `file/path.rs` format
+- Do NOT use emoji in section headers (`##`, `###`)
+- Do NOT use horizontal rules (`---`) — Discord doesn't render them properly
+- Do NOT bold field labels (What, Details, Usage, Code references, Status) — bold labels compete visually with `###` feature headings. Use plain text labels with a colon: `What:`, `Details:`, etc.
+- Use a double blank line before each `###` feature heading to visually separate features
+- Prefer clear writing over decorative elements
+- Use blank lines between sections instead of `---`
 
-START ANALYSIS:
+## Quality Checklist
 
-Begin your analysis now. Follow these steps:
+Before submitting, verify:
 
-1. Read the diff carefully to identify all user-facing changes
+- [ ] Every "new" feature confirmed absent from the previous version via source search
+- [ ] No internal-only changes included
+- [ ] Cargo.lock-only changes excluded
+- [ ] Every feature has a usage example or clear protocol/config example
+- [ ] Code references use stable identifiers + crate paths, not bare line numbers
+- [ ] No duplicate reporting across sections
+- [ ] Breaking protocol/config changes have migration guidance
+- [ ] Experimental / compile-gated / dark-launched features are labeled and moved to "In Development"
+- [ ] Output starts with `# Changelog for version X.X.X`
 
-2. Categorize each change appropriately:
-   - Verify if changes are truly new features or enhancements
-   - Use tasks for verification only if the diff context is insufficient
-   - Categorize correctly as NEW, ENHANCED, FIXED, or INTERNAL
+## CRITICAL: Output Format Rules
 
-3. Synthesize findings into the required format with proper sections
+**YOUR FIRST LINE MUST BE:** `# Changelog for version X.X.X`
 
-4. Double-check accuracy before finalizing
+DO NOT include ANY of these patterns before the changelog heading:
+- "Now I have enough information..."
+- "Let me summarize the changes..."
+- "Based on the diff..."
+- "I'll analyze..." / "I will analyze..."
+- "Here's the changelog..."
+- Any bullet-point summaries before the heading
+- Any meta-commentary about your process
 
-5. Ensure the final output starts with "# Changelog for version X.X.X" and contains only the changelog content with no additional commentary.
+WRONG (will be stripped):
+```
+Now I have enough information. Let me summarize:
+- Feature A
+- Feature B
 
-Your final response must be the complete, accurate changelog in the specified format and nothing else.
+# Changelog for version 0.125.0
+```
+
+CORRECT:
+```
+# Changelog for version 0.125.0
+
+## Summary
+This release adds Feature A and Feature B...
+```
+
+## Final Output Requirements
+
+1. **First line must be the H1 heading** — anything before it is wasted
+2. Use the exact section structure above
+3. Include code references for all major claims
+4. Omit empty sections entirely
+
+Begin analysis now.
