@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""Generate a changelog from pre-computed Haiku annotations.
+"""Generate a changelog from pre-computed change annotations.
 
 Takes the filtered annotations-{version}.json (output of annotate_changes.py)
-and uses a Sonnet agent to generate the final changelog.
+and uses the configured agent provider to generate the final changelog.
 
 Usage: python3 generate_annotated_changelog.py [version] [--min-importance N]
   e.g.: python3 generate_annotated_changelog.py v2.1.48
 """
 import asyncio
 import json
+import os
 import sys
-from collections import defaultdict
 from pathlib import Path
 
-from claude_agent_sdk import query, ResultMessage, ClaudeAgentOptions
+from agent_runner import AgentRunRequest, default_model_for, make_agent_runner
 
 MIN_IMPORTANCE = 2
-MODEL = "claude-sonnet-4-6"
+DEFAULT_AGENT_PROVIDER = (
+    os.getenv("CHANGELOG_AGENT_PROVIDER") or os.getenv("CHANGELOG_AGENT") or "claude"
+)
+DEFAULT_MODEL = os.getenv("CHANGELOG_AGENT_MODEL") or default_model_for(
+    DEFAULT_AGENT_PROVIDER, "changelog"
+)
 
 SYSTEM_PROMPT_PATH = Path("archive/claude-code/changelog/system-prompt.md")
 
@@ -95,7 +100,14 @@ def format_annotations_for_prompt(annotations: list[dict], version: str) -> str:
     return "\n".join(lines)
 
 
-async def generate(version: str, min_importance: int = MIN_IMPORTANCE):
+async def generate(
+    version: str,
+    min_importance: int = MIN_IMPORTANCE,
+    agent_provider: str = DEFAULT_AGENT_PROVIDER,
+    model: str = DEFAULT_MODEL,
+    codex_reasoning_effort: str = "medium",
+    codex_bin: str = "codex",
+):
     changes_dir = Path(f"archive/claude-code/changes/{version}")
     annotations_file = changes_dir / f"annotations-{version}.json"
     changelog_dir = Path("archive/claude-code/changelog")
@@ -122,25 +134,70 @@ verify specific details or find additional context for important changes.
 """
 
     print(f"\nGenerating annotated changelog for {version}...")
-    options = ClaudeAgentOptions(
-        system_prompt=system_prompt,
-        allowed_tools=["Read"],  # Allow reading source for verification only
-        permission_mode="bypassPermissions",
-        cwd=str(Path("archive/claude-code").resolve()),
+    runner = make_agent_runner(
+        agent_provider,
+        model=model,
+        reasoning_effort=codex_reasoning_effort
+        if agent_provider == "codex"
+        else None,
+        executable=codex_bin,
     )
+    runner.check_available()
 
-    result = ""
-    async for msg in query(prompt=user_prompt, options=options):
-        if isinstance(msg, ResultMessage):
-            if msg.is_error:
-                raise RuntimeError(msg.result or "query failed")
-            result = msg.result or ""
+    result = await asyncio.to_thread(
+        runner.run,
+        AgentRunRequest(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            allowed_tools=["Read"],
+            cwd=Path("archive/claude-code").resolve(),
+        ),
+    )
 
     output_file.write_text(f"# Changelog for version {version}\n\n{result}")
     print(f"Written to {output_file}")
 
 
 if __name__ == "__main__":
-    version = sys.argv[1] if len(sys.argv) > 1 else "v2.1.48"
-    min_imp = int(sys.argv[2]) if len(sys.argv) > 2 else MIN_IMPORTANCE
-    asyncio.run(generate(version, min_imp))
+    import argparse
+
+    p = argparse.ArgumentParser()
+    p.add_argument("version", nargs="?", default="v2.1.48")
+    p.add_argument("min_importance", nargs="?", type=int, default=MIN_IMPORTANCE)
+    p.add_argument(
+        "--agent-provider",
+        choices=("claude", "codex"),
+        default=DEFAULT_AGENT_PROVIDER,
+        help="Agent provider. Default: CHANGELOG_AGENT_PROVIDER or claude",
+    )
+    p.add_argument(
+        "--model",
+        default=None,
+        help="Changelog model. Default: provider-specific or CHANGELOG_AGENT_MODEL",
+    )
+    p.add_argument(
+        "--codex-reasoning-effort",
+        choices=("low", "medium", "high", "xhigh"),
+        default=os.getenv("CHANGELOG_CODEX_REASONING_EFFORT") or "medium",
+    )
+    p.add_argument(
+        "--codex-bin",
+        default=os.getenv("CHANGELOG_CODEX_BIN") or "codex",
+    )
+    args = p.parse_args()
+    if args.agent_provider not in ("claude", "codex"):
+        p.error("--agent-provider must be claude or codex")
+
+    model = args.model or os.getenv("CHANGELOG_AGENT_MODEL") or default_model_for(
+        args.agent_provider, "changelog"
+    )
+    asyncio.run(
+        generate(
+            args.version,
+            args.min_importance,
+            agent_provider=args.agent_provider,
+            model=model,
+            codex_reasoning_effort=args.codex_reasoning_effort,
+            codex_bin=args.codex_bin,
+        )
+    )

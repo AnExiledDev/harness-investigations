@@ -10,10 +10,10 @@ Architecture:
 - Phase 1: Download missing versions from npm registry
 - Phase 2: Prettify downloaded files using prettier (optional)
 - Phase 3: Generate diffs between consecutive versions (optional)
-- Phase 4: Generate changelogs using Claude SDK (optional)
+- Phase 4: Generate changelogs using the configured agent provider (optional)
   * If --cleanup is enabled: immediately clean each changelog after generation
   * If --post is enabled: immediately post each changelog after cleanup
-- Phase 5: Generate detailed changes using Claude SDK (optional)
+- Phase 5: Filter detailed changes for changelog input (optional)
 - Phase 6: Clean up changelog headers (optional, skipped if --changelog is enabled)
 - Phase 7: Post changelogs to Discord (optional, skipped if --changelog is enabled)
 
@@ -40,6 +40,13 @@ import requests
 from packaging import version
 
 import bun_extract
+from agent_runner import (
+    AgentRunRequest,
+    AgentRunnerError,
+    SUPPORTED_AGENT_PROVIDERS,
+    default_model_for,
+    make_agent_runner,
+)
 
 # Try to load .env file if python-dotenv is available
 try:
@@ -48,31 +55,6 @@ try:
 except ImportError:
     # python-dotenv not installed, skip loading .env file
     pass
-
-# Claude changelog generation uses the claude-agent-sdk package
-
-
-def _get_isolated_claude_config() -> Path:
-    """Return an isolated CLAUDE_CONFIG_DIR for SDK tasks.
-
-    Sessions are written to ~/.claude/projects/harness-investigations/projects/...
-    so ccusage finds them automatically (via **/*.jsonl) and groups them under
-    the project name "harness-investigations". They don't appear in --resume
-    because real project dirs start with '-' (hyphenated cwd paths); this dir
-    does not.
-    """
-    user_claude = Path.home() / ".claude"
-    claude_dir = user_claude / "projects" / "harness-investigations"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-
-    for fname in (".credentials.json", "settings.json"):
-        src = user_claude / fname
-        dst = claude_dir / fname
-        if src.exists() and not dst.exists():
-            dst.symlink_to(src)
-
-    return claude_dir
-
 
 class ProjectConfig:
     """Configuration for a specific project/package"""
@@ -199,6 +181,11 @@ class ClaudeCodeSync:
     _VERSION_BUMP_RE = re.compile(r'VERSION:\s*"[^"]*"')
     _BUILD_TIME_RE = re.compile(r'BUILD_TIME:\s*"[^"]*"')
     _BUILD_PATH_RE = re.compile(r'claude-cli-external-build-\d+')
+    _ASTDIFF_SECTION_RE = re.compile(
+        r"(?m)^=== (?:Removed(?: Functions)?|Added(?: Functions)?|"
+        r"Modified Functions|Structural Changes|String(?:-only)? Changes) ===$"
+    )
+    _ASTDIFF_ENTRY_RE = re.compile(r"(?m)^@@@ .+")
 
     def __init__(
         self,
@@ -217,6 +204,12 @@ class ClaudeCodeSync:
         dry_run: bool = False,
         annotate: bool = False,
         astdiff_threads: Optional[int] = None,
+        agent_provider: str = "claude",
+        changelog_model: Optional[str] = None,
+        annotation_model: Optional[str] = None,
+        codex_reasoning_effort: Optional[str] = None,
+        codex_annotation_reasoning_effort: Optional[str] = None,
+        codex_executable: str = "codex",
     ):
         self.base_dir = base_dir
         self.project = project
@@ -236,6 +229,16 @@ class ClaudeCodeSync:
         self.dry_run = dry_run
         self.annotate = annotate
         self.astdiff_threads = astdiff_threads
+        self.agent_provider = agent_provider.lower()
+        self.changelog_model = changelog_model or default_model_for(
+            self.agent_provider, "changelog"
+        )
+        self.annotation_model = annotation_model or default_model_for(
+            self.agent_provider, "annotation"
+        )
+        self.codex_reasoning_effort = codex_reasoning_effort
+        self.codex_annotation_reasoning_effort = codex_annotation_reasoning_effort
+        self.codex_executable = codex_executable
 
         # Directory structure - now project-specific
         self.archive_dir = base_dir / "archive" / project.name
@@ -259,6 +262,8 @@ class ClaudeCodeSync:
 
         self.stats = SyncStats()
         self._cleanup_module = None
+        self._changelog_agent = None
+        self._annotation_agent = None
 
     def setup_directories(self):
         """Create required directories"""
@@ -1375,14 +1380,44 @@ class ClaudeCodeSync:
         self._cleanup_module = module
         return module
 
-    def _check_sdk_available(self, feature_name: str) -> bool:
-        """Check if claude-agent-sdk is importable. Prints warning if not."""
+    def _get_agent_runner(self, role: str):
+        """Build and cache the configured agent runner for a role."""
+        if role == "annotation":
+            if self._annotation_agent is None:
+                self._annotation_agent = make_agent_runner(
+                    self.agent_provider,
+                    model=self.annotation_model,
+                    reasoning_effort=(
+                        self.codex_annotation_reasoning_effort
+                        if self.agent_provider == "codex"
+                        else None
+                    ),
+                    executable=self.codex_executable,
+                )
+            return self._annotation_agent
+
+        if self._changelog_agent is None:
+            self._changelog_agent = make_agent_runner(
+                self.agent_provider,
+                model=self.changelog_model,
+                reasoning_effort=(
+                    self.codex_reasoning_effort
+                    if self.agent_provider == "codex"
+                    else None
+                ),
+                executable=self.codex_executable,
+            )
+        return self._changelog_agent
+
+    def _check_agent_available(self, feature_name: str, role: str = "changelog") -> bool:
+        """Check if the configured agent provider is available."""
         try:
-            from claude_agent_sdk import query  # noqa: F401
+            self._get_agent_runner(role).check_available()
             return True
-        except ImportError:
-            print_warning(f"claude-agent-sdk not installed. Skipping {feature_name}.")
-            print_info("Install with: pip install claude-agent-sdk")
+        except AgentRunnerError as e:
+            print_warning(
+                f"{self.agent_provider} agent is unavailable. Skipping {feature_name}: {e}"
+            )
             return False
 
     def _ensure_prompt_file(self, directory: Path, filename: str, default_content: str, label: str):
@@ -1395,25 +1430,26 @@ class ClaudeCodeSync:
             print_success(f"Created {prompt_file}")
             print_info(f"You can edit this file to customize {label} generation")
 
-    def _run_query(self, prompt: str, options, timeout: int = None) -> str:
-        """Run a claude-agent-sdk query synchronously. Returns result text."""
-        import asyncio
-        from claude_agent_sdk import query, ResultMessage
-
-        async def _execute():
-            result = ""
-            async for msg in query(prompt=prompt, options=options):
-                if isinstance(msg, ResultMessage):
-                    if msg.is_error:
-                        raise RuntimeError(msg.result or "Claude query failed")
-                    result = msg.result or ""
-            return result
-
-        if timeout:
-            async def _with_timeout():
-                return await asyncio.wait_for(_execute(), timeout=timeout)
-            return asyncio.run(_with_timeout())
-        return asyncio.run(_execute())
+    def _run_agent_query(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        allowed_tools: Optional[List[str]] = None,
+        cwd: Optional[Path] = None,
+        env: Optional[dict] = None,
+        timeout: Optional[int] = None,
+        role: str = "changelog",
+    ) -> str:
+        """Run the configured agent provider synchronously."""
+        request = AgentRunRequest(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            cwd=cwd or self.base_dir,
+            allowed_tools=allowed_tools,
+            env=env,
+            timeout=timeout,
+        )
+        return self._get_agent_runner(role).run(request)
 
     # ── Annotation pipeline (hybrid changelog mode) ───────────────────────────
 
@@ -1480,11 +1516,10 @@ Batch {batch_id} of changes:
 {content}
 """
 
-    _ANNOTATION_MODEL = "claude-haiku-4-5-20251001"
     _ANNOTATION_SEMAPHORE = 4
 
     def _run_annotation_pipeline(self, version_str: str) -> "str | None":
-        """Run the full Haiku annotation pipeline. Returns compact annotation summary string."""
+        """Run the full annotation pipeline. Returns compact annotation summary string."""
         import asyncio as _asyncio
         import json as _json
 
@@ -1522,7 +1557,7 @@ Batch {batch_id} of changes:
             n = len(list(batches_dir.glob("batch-[0-9]*.json")))
             print_info(f"Using {n} existing batches in {batches_dir.name}")
 
-        # Step 2: Annotate batches with Haiku (async, concurrent)
+        # Step 2: Annotate batches with the configured small/fast model
         annotations = _asyncio.run(self._annotate_all_batches(batches_dir))
         if not annotations:
             return None
@@ -1543,11 +1578,10 @@ Batch {batch_id} of changes:
         return self._format_annotation_summary(annotations, version)
 
     async def _annotate_all_batches(self, batches_dir: Path) -> list:
-        """Annotate all un-annotated batch files in parallel with Haiku."""
+        """Annotate all un-annotated batch files with the configured agent."""
         import asyncio as _asyncio
         import json as _json
         import re as _re
-        from claude_agent_sdk import query as _query, ResultMessage as _RM, ClaudeAgentOptions as _Opts
 
         batch_files = sorted(
             f for f in batches_dir.glob("batch-*.json")
@@ -1566,49 +1600,83 @@ Batch {batch_id} of changes:
         if skipped:
             print_info(f"Skipping {skipped} already-annotated batches")
         if to_annotate:
-            print_info(f"Annotating {len(to_annotate)} batches with {self._ANNOTATION_MODEL}...")
+            print_info(
+                f"Annotating {len(to_annotate)} batches with "
+                f"{self.agent_provider}:{self.annotation_model}..."
+            )
 
-        semaphore = _asyncio.Semaphore(self._ANNOTATION_SEMAPHORE)
-        base = self.base_dir
+        def parse_annotations(output: str) -> list:
+            m = _re.search(r"<result>(.*?)</result>", output, _re.DOTALL)
+            if m:
+                try:
+                    return _json.loads(m.group(1).strip())
+                except _json.JSONDecodeError:
+                    return []
+            m2 = _re.search(r"\[\s*\{.*\}\s*\]", output, _re.DOTALL)
+            return _json.loads(m2.group(0)) if m2 else []
 
-        async def annotate_one(batch, out_path):
-            async with semaphore:
+        def write_annotations(batch, out_path, output: str) -> list:
+            anns = parse_annotations(output)
+            out_path.write_text(_json.dumps({**batch, "annotations": anns}, indent=2))
+            return anns
+
+        if self.agent_provider == "codex":
+            runner = self._get_agent_runner("annotation")
+            for batch, out_path in to_annotate:
                 prompt = self._ANNOTATION_PROMPT.format(
                     section=batch["section"],
                     batch_id=batch["id"],
                     content=batch["content"],
                 )
-                options = _Opts(
-                    model=self._ANNOTATION_MODEL,
-                    allowed_tools=[],
-                    permission_mode="bypassPermissions",
-                    cwd=str(base),
-                )
                 try:
-                    output = ""
-                    async for msg in _query(prompt=prompt, options=options):
-                        if isinstance(msg, _RM):
-                            if msg.is_error:
-                                raise RuntimeError(msg.result or "query failed")
-                            output = msg.result or ""
+                    output = runner.run(
+                        AgentRunRequest(
+                            prompt=prompt,
+                            cwd=self.base_dir,
+                            allowed_tools=[],
+                        )
+                    )
+                    write_annotations(batch, out_path, output)
                 except Exception as e:
                     print_warning(f"Batch {batch['id']:03d}: annotation error: {e}")
-                    return None
-
-                m = _re.search(r"<result>(.*?)</result>", output, _re.DOTALL)
-                if m:
-                    try:
-                        anns = _json.loads(m.group(1).strip())
-                    except _json.JSONDecodeError:
-                        anns = []
-                else:
-                    m2 = _re.search(r"\[\s*\{.*\}\s*\]", output, _re.DOTALL)
-                    anns = _json.loads(m2.group(0)) if m2 else []
-
-                out_path.write_text(_json.dumps({**batch, "annotations": anns}, indent=2))
-                return anns
+            to_annotate = []
 
         if to_annotate:
+            from claude_agent_sdk import (
+                ClaudeAgentOptions as _Opts,
+                ResultMessage as _RM,
+                query as _query,
+            )
+
+            semaphore = _asyncio.Semaphore(self._ANNOTATION_SEMAPHORE)
+            base = self.base_dir
+
+            async def annotate_one(batch, out_path):
+                async with semaphore:
+                    prompt = self._ANNOTATION_PROMPT.format(
+                        section=batch["section"],
+                        batch_id=batch["id"],
+                        content=batch["content"],
+                    )
+                    options = _Opts(
+                        model=self.annotation_model,
+                        allowed_tools=[],
+                        permission_mode="bypassPermissions",
+                        cwd=str(base),
+                    )
+                    try:
+                        output = ""
+                        async for msg in _query(prompt=prompt, options=options):
+                            if isinstance(msg, _RM):
+                                if msg.is_error:
+                                    raise RuntimeError(msg.result or "query failed")
+                                output = msg.result or ""
+                    except Exception as e:
+                        print_warning(f"Batch {batch['id']:03d}: annotation error: {e}")
+                        return None
+
+                    return write_annotations(batch, out_path, output)
+
             tasks = [annotate_one(b, p) for b, p in to_annotate]
             results = await _asyncio.gather(*tasks, return_exceptions=True)
             errors = sum(1 for r in results if isinstance(r, Exception))
@@ -1855,7 +1923,7 @@ Batch {batch_id} of changes:
                 not filtered_diff_path and not string_diff_path
             )
 
-            # Run Haiku annotation pre-pass if requested (hybrid mode)
+            # Run annotation pre-pass if requested (hybrid mode)
             annotation_summary = None
             if self.annotate:
                 print_info("Running annotation pipeline (hybrid mode)...")
@@ -1878,7 +1946,7 @@ Batch {batch_id} of changes:
             if annotation_summary:
                 cli_prompt_parts.append(f"""
 
-## Pre-analyzed Change Annotations (Haiku Pre-pass)
+## Pre-analyzed Change Annotations (Agent Pre-pass)
 
 The following annotations were produced by a fast model analyzing each change in
 the diff. Use them as a prioritized guide — but also read the diff files below for
@@ -1923,11 +1991,14 @@ formatting-only or version-bump hunks.  Use the Read tool with offset/limit
 if the file is large.
 """)
 
-            # Tell the agent to write the changelog to a specific path itself.
-            # This avoids the "last assistant message wins" failure mode where
-            # a wrap-up summary overwrites the real body in ResultMessage.result.
             rel_changelog = changelog_file.relative_to(self.base_dir)
-            output_instructions = f"""
+            changelog_agent = self._get_agent_runner("changelog")
+            agent_writes_file = changelog_agent.supports_file_write_tool
+            if agent_writes_file:
+                # Tell Claude to write the changelog itself. This avoids the
+                # "last assistant message wins" failure mode where a wrap-up
+                # summary overwrites the real body in ResultMessage.result.
+                output_instructions = f"""
 
 ## Output Instructions (CRITICAL)
 
@@ -1942,43 +2013,63 @@ Write the COMPLETE changelog to the file `{rel_changelog}` using the Write tool.
   confirmation only (e.g. "Wrote changelog to {rel_changelog}"). Do not echo
   the changelog body back in your final message.
 """
+            else:
+                # Codex exec exposes a reliable --output-last-message path, so
+                # keep the model read-only and let this script write the file.
+                output_instructions = f"""
+
+## Output Instructions (CRITICAL)
+
+Return the COMPLETE changelog markdown as your final answer.
+
+- Begin with `# Changelog for version {version_str}` followed by a blank line.
+- Then produce the FULL changelog body: per-feature `## Section` headings with
+  explanations, examples, and evidence as described in the system prompt.
+- Do NOT edit files.
+- Do NOT return a summary, outline, or "here are the key changes" overview.
+- Do NOT wrap the changelog in a Markdown code fence.
+"""
             base_cli_prompt = "".join(cli_prompt_parts) + output_instructions
 
             # How many lines of input did the agent get? Used by the validator
             # to scale the minimum-output-size heuristic.
             try:
+                line_source = filtered_diff_path or (diff_file if raw_diff_fallback else None)
                 changes_lines = (
-                    sum(1 for _ in open(filtered_diff_path, "r", encoding="utf-8"))
-                    if filtered_diff_path else 0
+                    sum(1 for _ in open(line_source, "r", encoding="utf-8"))
+                    if line_source else 0
                 )
             except Exception:
                 changes_lines = 0
 
             try:
-                from claude_agent_sdk import ClaudeAgentOptions
-
-                options = ClaudeAgentOptions(
-                    system_prompt=system_prompt,
-                    allowed_tools=["Read", "Glob", "Grep", "Write"],
-                    permission_mode="bypassPermissions",
-                    cwd=str(self.base_dir),
-                    env={"CLAUDE_CONFIG_DIR": str(_get_isolated_claude_config())},
-                )
-
                 cli_prompt = base_cli_prompt
                 last_reason = None
                 changelog_content = ""
                 file_body = ""
+                allowed_tools = ["Read", "Glob", "Grep"]
+                if agent_writes_file:
+                    allowed_tools.append("Write")
+                retry_action = (
+                    f"call the Write tool to write the COMPLETE changelog to `{rel_changelog}`"
+                    if agent_writes_file
+                    else "return the COMPLETE changelog markdown as your final answer"
+                )
+                retry_output_noun = "file" if agent_writes_file else "final answer"
                 for attempt in (1, 2):
                     # Pre-clear the target file so we can detect whether the
                     # agent actually wrote to it on this attempt.
                     changelog_file.unlink(missing_ok=True)
 
-                    changelog_content = self._run_query(cli_prompt, options)
+                    changelog_content = self._run_agent_query(
+                        cli_prompt,
+                        system_prompt=system_prompt,
+                        allowed_tools=allowed_tools,
+                        cwd=self.base_dir,
+                        role="changelog",
+                    )
 
-                    # Prefer the file the agent wrote; fall back to the result
-                    # text if the agent ignored the Write instruction.
-                    if changelog_file.exists():
+                    if agent_writes_file and changelog_file.exists():
                         try:
                             file_body = changelog_file.read_text(encoding="utf-8")
                         except Exception:
@@ -1987,7 +2078,8 @@ Write the COMPLETE changelog to the file `{rel_changelog}` using the Write tool.
                         file_body = ""
 
                     if not file_body.strip() and changelog_content.strip():
-                        # Agent didn't use Write — recover the result text.
+                        # Claude fallback: agent ignored Write. Codex normal path:
+                        # script writes the final read-only response.
                         with open(changelog_file, "w", encoding="utf-8") as f:
                             if not changelog_content.lstrip().startswith("# "):
                                 f.write(f"# Changelog for version {version_str}\n\n")
@@ -2012,12 +2104,12 @@ Write the COMPLETE changelog to the file `{rel_changelog}` using the Write tool.
 Your previous output was rejected by the validator. Reason: {last_reason}
 
 Do NOT produce a summary, an outline, or an overview. Read the diff files
-fully (use Read with offset/limit if needed), then call the Write tool to
-write the COMPLETE changelog to `{rel_changelog}`. The file must contain
-multiple `## ` section headings with full per-feature explanations.
+fully (use Read with offset/limit if needed), then {retry_action}.
+The {retry_output_noun} must contain multiple `## ` section headings with full
+per-feature explanations.
 """
             except Exception as e:
-                print_warning(f"Claude SDK execution failed: {e}")
+                print_warning(f"{self.agent_provider} agent execution failed: {e}")
                 return False
 
             if last_reason:
@@ -2054,7 +2146,7 @@ multiple `## ` section headings with full per-feature explanations.
         # Ensure the system prompt file exists
         self.ensure_changelog_prompt()
 
-        if not self._check_sdk_available("changelog generation"):
+        if not self._check_agent_available("changelog generation", role="changelog"):
             return
 
         print_info("Checking for changelogs to generate...")
@@ -2086,9 +2178,41 @@ multiple `## ` section headings with full per-feature explanations.
 
     def get_versions_to_filter(self) -> List[str]:
         """Get list of versions that need filtered diff files"""
-        return self._get_versions_needing_output(
-            self.changes_dir, "changes-v{version}.md"
-        )
+        versions_needed = []
+        diff_files = list(self.diff_dir.glob("v*.diff"))
+
+        if self.latest and diff_files:
+            valid_diff_files = [
+                f for f in diff_files
+                if RE_DIFF_VERSION.match(f.name)
+            ]
+            if valid_diff_files:
+                valid_diff_files.sort(
+                    key=lambda p: version.parse(
+                        RE_DIFF_VERSION.match(p.name).group(1)
+                    ),
+                    reverse=True,
+                )
+                diff_files = [valid_diff_files[0]]
+            else:
+                diff_files = []
+
+        for diff_file in diff_files:
+            match = RE_DIFF_VERSION.match(diff_file.name)
+            if not match:
+                continue
+
+            version_str = match.group(1)
+            if self._is_before_since(version_str):
+                continue
+
+            md_output = self.changes_dir / f"changes-v{version_str}.md"
+            raw_output = self.changes_dir / f"changes-v{version_str}.diff"
+            if not md_output.exists() and not raw_output.exists():
+                versions_needed.append(version_str)
+
+        versions_needed.sort(key=version.parse, reverse=self.new_first)
+        return versions_needed
 
     def filter_diff(self, version_str: str, iteration: int = 1) -> bool:
         """Filter astdiff output to remove noise. Pure Python, no SDK needed.
@@ -2118,11 +2242,14 @@ multiple `## ` section headings with full per-feature explanations.
             with open(diff_file, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            if "=== Removed" not in content and "=== Added" not in content:
-                print_warning(
-                    f"Diff for v{version_str} is not astdiff format, skipping filter"
+            if not self._looks_like_astdiff(content):
+                raw_changes_file = self.changes_dir / f"changes-v{version_str}.diff"
+                raw_changes_file.write_text(content)
+                print_info(
+                    f"Diff for v{version_str} is not astdiff format; "
+                    "saved raw diff for changelog input"
                 )
-                return False
+                return True
 
             filtered = self._filter_astdiff(content)
 
@@ -2138,6 +2265,27 @@ multiple `## ` section headings with full per-feature explanations.
             return False
 
     # ── astdiff filtering ──────────────────────────────────────────────
+
+    def _looks_like_astdiff(self, content: str) -> bool:
+        """Return True when diff content matches known astdiff output shapes."""
+        header_lines = content.splitlines()[:8]
+        has_astdiff_summary = any(
+            line.startswith(
+                (
+                    "Structural similarity:",
+                    "Matched:",
+                    "Matched declarations:",
+                    "Diff size:",
+                    "Changes:",
+                )
+            )
+            for line in header_lines
+        )
+        has_astdiff_body = (
+            self._ASTDIFF_SECTION_RE.search(content) is not None
+            or self._ASTDIFF_ENTRY_RE.search(content) is not None
+        )
+        return has_astdiff_summary and has_astdiff_body
 
     def _filter_astdiff(self, content: str) -> str:
         """Parse and filter astdiff output, removing version bumps and reformatting noise."""
@@ -2253,9 +2401,13 @@ multiple `## ` section headings with full per-feature explanations.
         """Parse astdiff output into header + per-section entry lists."""
         section_markers = {
             "=== Removed ===": "removed",
+            "=== Removed Functions ===": "removed",
             "=== Added ===": "added",
+            "=== Added Functions ===": "added",
+            "=== Modified Functions ===": "structural",
             "=== Structural Changes ===": "structural",
             "=== String Changes ===": "string",
+            "=== String-only Changes ===": "string",
         }
 
         # Split on section markers, keeping them as delimiters
@@ -2411,6 +2563,13 @@ multiple `## ` section headings with full per-feature explanations.
             return
 
         print_header("Phase 5: Filtering Diffs")
+
+        if not self.project.use_astdiff:
+            print_info(
+                "Skipping diff filtering for this project; changelog generation "
+                "will use raw unified diffs."
+            )
+            return
 
         print_info("Checking for diffs to filter...")
 
@@ -2685,6 +2844,11 @@ Package: `{self.project.npm_package}`
             title = f"{project_display} Archive Sync Tool"
             print(colored(title, Colors.BOLD + Colors.PURPLE))
             print(colored("=" * len(title), Colors.PURPLE))
+            if self.changelog or self.annotate:
+                print_info(
+                    f"Agent provider: {self.agent_provider} "
+                    f"(changelog={self.changelog_model}, annotation={self.annotation_model})"
+                )
 
             # Setup
             self.setup_directories()
@@ -2971,6 +3135,7 @@ Examples:
   %(prog)s --changelog --new-first                  # Generate changelogs (newest first)
   %(prog)s --prettier --diff --changelog            # Generate diffs and changelogs
   %(prog)s --diff --changes                         # Generate diffs and filter to meaningful changes
+  %(prog)s --project codex --changelog --agent-provider codex
   %(prog)s --redo 69 --changelog                    # Redo changelog for v1.0.69
   %(prog)s --project codex --all                    # Process all Codex versions
         """,
@@ -2999,7 +3164,7 @@ Examples:
     parser.add_argument(
         "--changelog",
         action="store_true",
-        help="Generate changelogs using Claude SDK (processes available diffs)",
+        help="Generate changelogs using the configured agent provider (processes available diffs)",
     )
 
     parser.add_argument(
@@ -3062,7 +3227,7 @@ Examples:
         "--annotate",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Run Haiku pre-annotation pass before changelog generation (hybrid mode: annotations + diffs). Default: disabled (expensive; hundreds of Haiku calls per version). Use --annotate to enable.",
+        help="Run a fast-model pre-annotation pass before changelog generation (hybrid mode: annotations + diffs). Default: disabled (expensive; many calls per version). Use --annotate to enable.",
     )
 
     parser.add_argument(
@@ -3072,7 +3237,69 @@ Examples:
         help="Limit astdiff parallelism (RAYON_NUM_THREADS). Default: half of available cores",
     )
 
+    parser.add_argument(
+        "--agent-provider",
+        choices=SUPPORTED_AGENT_PROVIDERS,
+        default=os.getenv("CHANGELOG_AGENT_PROVIDER")
+        or os.getenv("CHANGELOG_AGENT")
+        or "claude",
+        help=(
+            "Agent provider for changelog generation. Can also be set with "
+            "CHANGELOG_AGENT_PROVIDER or CHANGELOG_AGENT. Default: claude"
+        ),
+    )
+
+    parser.add_argument(
+        "--changelog-model",
+        default=os.getenv("CHANGELOG_AGENT_MODEL")
+        or os.getenv("CHANGELOG_CHANGELOG_MODEL"),
+        help=(
+            "Model for final changelog generation. Defaults by provider "
+            "(claude: claude-sonnet-4-6, codex: gpt-5.5)."
+        ),
+    )
+
+    parser.add_argument(
+        "--annotation-model",
+        default=os.getenv("CHANGELOG_ANNOTATION_MODEL"),
+        help=(
+            "Model for --annotate batches. Defaults by provider "
+            "(claude: claude-haiku-4-5-20251001, codex: gpt-5.4-mini)."
+        ),
+    )
+
+    parser.add_argument(
+        "--codex-reasoning-effort",
+        default=os.getenv("CHANGELOG_CODEX_REASONING_EFFORT") or "medium",
+        choices=["low", "medium", "high", "xhigh"],
+        help="Codex reasoning effort for final changelog generation. Default: medium",
+    )
+
+    parser.add_argument(
+        "--codex-annotation-reasoning-effort",
+        default=os.getenv("CHANGELOG_CODEX_ANNOTATION_REASONING_EFFORT") or "low",
+        choices=["low", "medium", "high", "xhigh"],
+        help="Codex reasoning effort for --annotate batches. Default: low",
+    )
+
+    parser.add_argument(
+        "--codex-bin",
+        default=os.getenv("CHANGELOG_CODEX_BIN") or "codex",
+        help="Codex executable to use when --agent-provider=codex. Default: codex",
+    )
+
     args = parser.parse_args()
+
+    if args.agent_provider not in SUPPORTED_AGENT_PROVIDERS:
+        parser.error(
+            "--agent-provider must be one of: "
+            + ", ".join(SUPPORTED_AGENT_PROVIDERS)
+        )
+
+    if args.changelog_model is None:
+        args.changelog_model = default_model_for(args.agent_provider, "changelog")
+    if args.annotation_model is None:
+        args.annotation_model = default_model_for(args.agent_provider, "annotation")
 
     # Handle --all flag
     if args.all:
@@ -3115,6 +3342,12 @@ Examples:
         dry_run=args.dry_run,
         annotate=args.annotate,
         astdiff_threads=args.astdiff_threads if args.astdiff_threads else os.cpu_count() // 2,
+        agent_provider=args.agent_provider,
+        changelog_model=args.changelog_model,
+        annotation_model=args.annotation_model,
+        codex_reasoning_effort=args.codex_reasoning_effort,
+        codex_annotation_reasoning_effort=args.codex_annotation_reasoning_effort,
+        codex_executable=args.codex_bin,
     )
 
     # If --redo is specified, run the redo process instead

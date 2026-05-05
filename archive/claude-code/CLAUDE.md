@@ -4,9 +4,9 @@ This file provides guidance to Claude Code when working with the claude-code arc
 
 ## Current Claude Code Version
 
-The latest prettified version available for analysis is **v2.1.124**.
+The latest prettified version available for analysis is **v2.1.128**.
 
-File location: `pretty/pretty-v2.1.124.js`
+File location: `pretty/pretty-v2.1.128.js`
 
 ## Archive Structure
 
@@ -19,6 +19,6 @@ File location: `pretty/pretty-v2.1.124.js`
 ## Latest Version Information
 
 When analyzing Claude Code's source, please use the prettified version at:
-`pretty/pretty-v2.1.124.js`
+`pretty/pretty-v2.1.128.js`
 
 Package: `@anthropic-ai/claude-code`

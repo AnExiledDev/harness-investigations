@@ -97,11 +97,27 @@ Project definitions live in the =PROJECTS= dict near the top of =tools/sync.py=.
    cargo install --git https://github.com/shcv/astdiff
    #+end_src
 
-4. Authenticate the harness used for changelog generation. =sync.py= calls
-   =claude-agent-sdk='s =query()= against an isolated config dir at
-   =~/.claude/projects/harness-investigations/= so its sessions don't pollute
-   =--resume= and ccusage groups them under that name. =.credentials.json=
-   and =settings.json= are symlinked in from =~/.claude= on first run.
+4. Authenticate the harness used for changelog generation. The agent provider
+   is configurable:
+
+   - =--agent-provider claude= uses =claude-agent-sdk='s =query()= against an
+     isolated config dir at =~/.claude/projects/harness-investigations/= so its
+     sessions don't pollute =--resume= and ccusage groups them under that name.
+     =.credentials.json= and =settings.json= are symlinked in from =~/.claude=
+     on first run.
+   - =--agent-provider codex= shells out to =codex exec= in read-only sandbox
+     mode and writes the returned changelog itself. Authenticate with the normal
+     Codex CLI login first.
+
+   You can set the default in =.env=:
+
+   #+begin_src bash
+   CHANGELOG_AGENT_PROVIDER=codex
+   CHANGELOG_AGENT_MODEL=gpt-5.5
+   CHANGELOG_ANNOTATION_MODEL=gpt-5.4-mini
+   CHANGELOG_CODEX_REASONING_EFFORT=medium
+   CHANGELOG_CODEX_ANNOTATION_REASONING_EFFORT=low
+   #+end_src
 
 5. Discord posting (optional). Copy the example config and edit:
    #+begin_src bash
@@ -131,6 +147,9 @@ python tools/sync.py --project claude-code --changelog --since v2.0.0
 # Newest first (instead of chronological)
 python tools/sync.py --project codex --all --new-first
 
+# Generate using Codex instead of Claude
+python tools/sync.py --project codex --changelog --agent-provider codex
+
 # Redo a single version's changelog (creates iteration -2, -3, ...)
 python tools/sync.py --project claude-code --redo 2.0.37 --changelog
 
@@ -152,7 +171,9 @@ python tools/sync.py --project codex --post
 | =--all=        | Enable all of the above                                                   |
 
 Useful modifiers: =--latest=, =--since VERSION=, =--new-first=, =--redo SPEC=,
-=--annotate= (Haiku pre-pass; expensive), =--astdiff-threads N=, =--dry-run=.
+=--annotate= (fast-model pre-pass; expensive), =--astdiff-threads N=,
+=--agent-provider claude|codex=, =--changelog-model MODEL=,
+=--annotation-model MODEL=, =--dry-run=.
 
 ** What Lands in Git
 

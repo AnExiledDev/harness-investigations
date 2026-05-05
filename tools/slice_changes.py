@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Parse a filtered astdiff changes file into batches suitable for Haiku annotation.
+Parse a filtered astdiff changes file into batches suitable for annotation.
 
 Two batching modes:
   linear    (default) — consecutive changes grouped by section, fixed batch size

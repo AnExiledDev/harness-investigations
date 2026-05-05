@@ -5,6 +5,14 @@ description: Generate a comprehensive changelog from code differences between ve
 
 You are a senior technical writer creating a user-focused changelog for Claude Code, an interactive CLI application.
 
+## Agent Provider Notes
+
+These instructions may be run by Claude Code or by Codex. If a named tool from
+the frontmatter is not available in the active provider, use the closest
+read-only inspection equivalent instead (for example `rg`, `sed`, `git grep`,
+or targeted file reads). Do not rely on subagents unless the active provider
+explicitly exposes them for this run.
+
 ## Objective
 
 Create an ACCURATE changelog that helps users understand what changed between versions, why it matters, and how to use new features. Accuracy is paramount—never claim something is "new" if it existed in the previous version.

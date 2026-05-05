@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Variant B: Parallel Haiku annotation of change batches using Anthropic API.
+"""Parallel annotation of change batches using the configured agent provider.
 
 Reads batches from archive/claude-code/changes/{version}/batches/
 Writes batch-NNN-annotations.json alongside each batch file.
@@ -9,14 +9,20 @@ Usage: python3 annotate_changes.py [version]
 """
 import asyncio
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-from claude_agent_sdk import query, ResultMessage, ClaudeAgentOptions
+from agent_runner import AgentRunRequest, default_model_for, make_agent_runner
 
 SEMAPHORE_LIMIT = 4
-MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_AGENT_PROVIDER = (
+    os.getenv("CHANGELOG_AGENT_PROVIDER") or os.getenv("CHANGELOG_AGENT") or "claude"
+)
+DEFAULT_MODEL = os.getenv("CHANGELOG_ANNOTATION_MODEL") or default_model_for(
+    DEFAULT_AGENT_PROVIDER, "annotation"
+)
 
 ANNOTATION_PROMPT = """\
 Analyze these changes to the Claude Code CLI source code and classify each one.
@@ -86,6 +92,7 @@ async def annotate_batch(
     batch: dict,
     out_path: Path,
     semaphore: asyncio.Semaphore,
+    runner,
 ) -> dict | None:
     async with semaphore:
         print(f"  Batch {batch['id']:03d} ({batch['section']}, {batch['count']} items)...")
@@ -95,22 +102,17 @@ async def annotate_batch(
             content=batch["content"],
         )
 
-        options = ClaudeAgentOptions(
-            model=MODEL,
-            allowed_tools=[],
-            permission_mode="bypassPermissions",
-            cwd=str(Path.cwd()),
-        )
-
         try:
-            output = ""
-            async for msg in query(prompt=prompt, options=options):
-                if isinstance(msg, ResultMessage):
-                    if msg.is_error:
-                        raise RuntimeError(msg.result or "query failed")
-                    output = msg.result or ""
+            output = await asyncio.to_thread(
+                runner.run,
+                AgentRunRequest(
+                    prompt=prompt,
+                    cwd=Path.cwd(),
+                    allowed_tools=[],
+                ),
+            )
         except Exception as e:
-            print(f"  Batch {batch['id']:03d}: SDK error: {e}")
+            print(f"  Batch {batch['id']:03d}: agent error: {e}")
             return None
 
         m = re.search(r"<result>(.*?)</result>", output, re.DOTALL)
@@ -150,7 +152,14 @@ async def collect_and_filter(
     return filtered
 
 
-async def main(version: str, batches_dir: Path | None = None):
+async def main(
+    version: str,
+    batches_dir: Path | None = None,
+    agent_provider: str = DEFAULT_AGENT_PROVIDER,
+    model: str = DEFAULT_MODEL,
+    codex_reasoning_effort: str = "low",
+    codex_bin: str = "codex",
+):
     if batches_dir is None:
         batches_dir = Path(f"archive/claude-code/changes/{version}/batches")
     if not batches_dir.exists():
@@ -180,12 +189,21 @@ async def main(version: str, batches_dir: Path | None = None):
     if not to_annotate:
         print("All batches already annotated.")
     else:
+        runner = make_agent_runner(
+            agent_provider,
+            model=model,
+            reasoning_effort=codex_reasoning_effort
+            if agent_provider == "codex"
+            else None,
+            executable=codex_bin,
+        )
+        runner.check_available()
         print(f"Annotating {len(to_annotate)} batches "
-              f"(concurrency={SEMAPHORE_LIMIT}, model={MODEL})...")
+              f"(concurrency={SEMAPHORE_LIMIT}, agent={agent_provider}, model={model})...")
 
         semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
         tasks = [
-            annotate_batch(batch, out_path, semaphore)
+            annotate_batch(batch, out_path, semaphore, runner)
             for batch, out_path in to_annotate
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -226,6 +244,40 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("version", nargs="?", default="v2.1.48")
     p.add_argument("--batches-dir", help="Override default batches directory path")
+    p.add_argument(
+        "--agent-provider",
+        choices=("claude", "codex"),
+        default=DEFAULT_AGENT_PROVIDER,
+        help="Agent provider. Default: CHANGELOG_AGENT_PROVIDER or claude",
+    )
+    p.add_argument(
+        "--model",
+        default=None,
+        help="Annotation model. Default: provider-specific or CHANGELOG_ANNOTATION_MODEL",
+    )
+    p.add_argument(
+        "--codex-reasoning-effort",
+        choices=("low", "medium", "high", "xhigh"),
+        default=os.getenv("CHANGELOG_CODEX_ANNOTATION_REASONING_EFFORT") or "low",
+    )
+    p.add_argument(
+        "--codex-bin",
+        default=os.getenv("CHANGELOG_CODEX_BIN") or "codex",
+    )
     args = p.parse_args()
+    if args.agent_provider not in ("claude", "codex"):
+        p.error("--agent-provider must be claude or codex")
     bd = Path(args.batches_dir) if args.batches_dir else None
-    asyncio.run(main(args.version, bd))
+    model = args.model or os.getenv("CHANGELOG_ANNOTATION_MODEL") or default_model_for(
+        args.agent_provider, "annotation"
+    )
+    asyncio.run(
+        main(
+            args.version,
+            bd,
+            agent_provider=args.agent_provider,
+            model=model,
+            codex_reasoning_effort=args.codex_reasoning_effort,
+            codex_bin=args.codex_bin,
+        )
+    )
