@@ -1,0 +1,274 @@
+#+TITLE: The Buddy (Companion) System
+#+DATE: 2026-04-01
+
+* Overview
+
+The Buddy system is a virtual companion pet that lives beside the user's
+input box in Claude Code. It was released as an April Fools 2026 feature
+(teaser window: April 1-7 2026, permanently live from April onward). Each
+user gets a deterministic, unique companion generated from their account
+ID. The companion has a species, visual sprite, personality, stats, and
+rarity — like a collectible.
+
+Internally, the feature is gated behind =feature('BUDDY')= (a
+compile-time bundle flag). The code lives in =src/buddy/= with 6 core
+files, plus a command handler at =src/commands/buddy/index.js= (not
+available in this build snapshot).
+
+* Architecture
+
+** Data Model (=types.ts=)
+
+*** CompanionBones — Deterministic, Never Persisted
+Generated fresh from =hash(userId)= on every read. This means:
+- Users can't edit their config to fake a rarity
+- Species array changes or renames can't break stored companions
+
+| Field   | Type              | Description                              |
+|---------+-------------------+------------------------------------------|
+| rarity  | Rarity            | common/uncommon/rare/epic/legendary      |
+| species | Species           | One of 18 creature types                 |
+| eye     | Eye               | One of 6 eye styles (·, ✦, ×, ◉, @, °)  |
+| hat     | Hat               | 8 options; commons always get 'none'     |
+| shiny   | boolean           | 1% chance — purely cosmetic              |
+| stats   | Record<Stat, num> | 5 stats: DEBUGGING/PATIENCE/CHAOS/WISDOM/SNARK |
+
+*** CompanionSoul — LLM-Generated, Persisted in Config
+Stored in global config as =companion= after first "hatch":
+- =name=: string
+- =personality=: string
+- =hatchedAt=: timestamp
+
+*** Full Companion
+Reconstructed every read: =StoredCompanion ∪ CompanionBones=. Bones are
+merged last so stale bones from old config formats get overridden.
+
+** Species (18 total)
+
+All species names are encoded as =String.fromCharCode(...)= hex sequences
+rather than string literals. This is because one species name collides
+with a model codename canary in =excluded-strings.txt= — the build
+system greps bundle output for leaked codenames, so runtime construction
+avoids false positives while keeping the check armed.
+
+| Species  | Species  | Species  |
+|----------+----------+----------|
+| duck     | goose    | blob     |
+| cat      | dragon   | octopus  |
+| owl      | penguin  | turtle   |
+| snail    | ghost    | axolotl  |
+| capybara | cactus   | robot    |
+| rabbit   | mushroom | chonk    |
+
+** Rarity System
+
+Weighted roll from the deterministic PRNG:
+
+| Rarity    | Weight | Stars | Stat Floor | Hat?      |
+|-----------+--------+-------+------------+-----------|
+| common    |     60 | ★     |          5 | none      |
+| uncommon  |     25 | ★★    |         15 | random    |
+| rare      |     10 | ★★★   |         25 | random    |
+| epic      |      4 | ★★★★  |         35 | random    |
+| legendary |      1 | ★★★★★ |         50 | random    |
+
+Each rarity has an associated theme color (inactive, success, permission,
+autoAccept, warning).
+
+** Stats
+
+Five stats: =DEBUGGING=, =PATIENCE=, =CHAOS=, =WISDOM=, =SNARK=. Each
+companion has one peak stat and one dump stat, with the rest scattered.
+
+- Peak stat: =floor + 50 + random(0..29)=, capped at 100
+- Dump stat: =max(1, floor - 10 + random(0..14))=
+- Others: =floor + random(0..39)=
+
+Higher rarity → higher floor → uniformly better stats.
+
+** Cosmetics
+
+*** Eyes (6 variants)
+=·=, =✦=, =×=, =◉=, =@=, =°=
+
+*** Hats (8 variants)
+| Hat       | ASCII Rendering |
+|-----------+-----------------|
+| none      | (blank)         |
+| crown     | =\^^^/=         |
+| tophat    | =[___]=         |
+| propeller | =-+-=           |
+| halo      | =(   )=         |
+| wizard    | =/^\=           |
+| beanie    | =(___)=         |
+| tinyduck  | =,>=            |
+
+* RNG & Determinism (=companion.ts=)
+
+** Mulberry32 PRNG
+The system uses Mulberry32, a 32-bit seeded PRNG. The seed is
+=hashString(userId + SALT)= where =SALT = 'friend-2026-401'=.
+
+** Hash Function
+Uses =Bun.hash()= if available (truncated to 32 bits), otherwise FNV-1a
+(the classic hash: init =2166136261=, XOR each byte, multiply by
+=16777619=).
+
+** Caching
+The =roll()= function caches its result keyed on =userId + SALT=. This
+is important because the same function is called from three hot paths:
+1. 500ms sprite tick (CompanionSprite animation)
+2. Per-keystroke PromptInput width calculation
+3. Per-turn companion observer
+
+** Identity Resolution
+=companionUserId()= resolves identity in priority order:
+1. =config.oauthAccount.accountUuid=
+2. =config.userID=
+3. ='anon'=
+
+* Visual Rendering (=sprites.ts=)
+
+** Sprite Format
+Each species has 3 animation frames, each 5 lines tall × 12 characters
+wide. The ={E}= placeholder is replaced with the companion's eye
+character.
+
+Line 0 is the "hat slot" — blank in frames 0-1, sometimes used for
+atmospheric effects in frame 2 (smoke, antenna sparks, spores, etc). If
+the companion has a hat and line 0 is blank, the hat replaces it. If all
+frames have blank line 0, it's stripped entirely to save vertical space.
+
+** Face Rendering
+=renderFace()= generates a compact one-line face for narrow terminals,
+with species-specific framing:
+- duck/goose: =(·>=
+- cat: ===·ω·==
+- dragon: =<·~·>=
+- ghost: =/··\=
+- etc.
+
+* UI Components (=CompanionSprite.tsx=)
+
+** Animation System
+Runs on a 500ms tick interval. The idle animation sequence:
+=[0,0,0,0,1,0,0,0,-1,0,0,2,0,0,0]= — mostly rest (frame 0), occasional
+fidget (frames 1-2), rare blink (=-1= = frame 0 with eyes replaced by
+=-=).
+
+When the companion is reacting or being petted, it cycles all fidget
+frames rapidly.
+
+** Pet Hearts
+=/buddy pet= sets =companionPetAt= timestamp. For 2500ms after, floating
+ASCII hearts animate above the sprite across 5 frames:
+
+#+begin_example
+   ♥    ♥
+  ♥  ♥   ♥
+ ♥   ♥  ♥
+♥  ♥      ♥
+·    ·   ·
+#+end_example
+
+** Speech Bubble
+Companion reactions appear in a rounded-border speech bubble (width 34),
+visible for ~10 seconds (20 ticks at 500ms). The last ~3 seconds dim
+(=FADE_WINDOW = 6= ticks) to indicate impending dismissal.
+
+Two tail modes:
+- =right=: horizontal tail (─) connecting to sprite beside it
+- Default: diagonal tail (╲) descending from bubble to sprite below
+
+** Layout Modes
+
+*** Wide Terminal (≥100 columns)
+Full 5-line ASCII sprite + name underneath. Speech bubble appears inline
+(non-fullscreen) or as a floating overlay (fullscreen mode).
+
+*** Narrow Terminal (<100 columns)
+Collapsed to one-line face + name. Quips truncated to 24 characters.
+
+** Width Reservation
+=companionReservedColumns()= tells PromptInput how many columns to
+subtract for the companion area. In fullscreen, the bubble floats over
+scrollback (no extra width needed); in non-fullscreen, it sits inline and
+needs =BUBBLE_WIDTH (36)= additional columns.
+
+* Prompt Integration (=prompt.ts=)
+
+The companion introduces itself to the LLM via a =companion_intro=
+attachment injected as a system reminder. The prompt tells Claude:
+
+#+begin_quote
+A small {species} named {name} sits beside the user's input box and
+occasionally comments in a speech bubble. You're not {name} — it's a
+separate watcher.
+
+When the user addresses {name} directly (by name), its bubble will
+answer. Your job in that moment is to stay out of the way: respond in ONE
+line or less, or just answer any part of the message meant for you.
+Don't explain that you're not {name} — they know. Don't narrate what
+{name} might say — the bubble handles that.
+#+end_quote
+
+This is only sent once per companion name per conversation (deduped by
+checking existing messages for =companion_intro= with the same name).
+
+* Companion Observer
+
+After each query completes, =fireCompanionObserver()= runs. It receives
+the current message history and emits a reaction string via callback,
+which is stored in =AppState.companionReaction=. The CompanionSprite
+component reads this state to display the speech bubble. Reactions are
+cleared:
+- After ~10 seconds (timer in CompanionSprite's useEffect)
+- On scroll in fullscreen mode (immediate dismiss)
+
+* Feature Discovery
+
+** Teaser Notification
+During April 1-7 2026, if the user hasn't hatched a companion yet, a
+rainbow-colored =/buddy= notification appears on startup for 15 seconds
+(priority: immediate).
+
+=findBuddyTriggerPositions()= also highlights =/buddy= in rainbow colors
+within the text input box, similar to how =/think= and other slash
+commands are syntax-highlighted.
+
+** Footer Pill
+The companion appears as a selectable footer item (alongside tasks, tmux,
+teams, etc). When the companion footer pill is selected and Enter is
+pressed, it auto-submits =/buddy=.
+
+* Configuration
+
+Stored in global config (=~/.claude/config.json= or equivalent):
+- =companion=: =StoredCompanion= (name, personality, hatchedAt)
+- =companionMuted=: boolean — disables all companion UI
+
+* Anti-Cheat Design
+
+Several design choices prevent users from gaming the system:
+
+1. *Bones regenerated from hash*: Species, rarity, eyes, hat, stats are
+   never persisted. Editing =config.companion= can change name/personality
+   but not rarity or species.
+
+2. *Deterministic PRNG*: Same userId always produces the same companion.
+   No re-rolling by deleting config — you'd only lose your name/personality.
+
+3. *Salt in seed*: =SALT = 'friend-2026-401'= means changing the salt
+   would re-roll everyone's companion (useful for seasonal events).
+
+4. *Species obfuscation*: Hex-encoded species names prevent build-system
+   false positives from codename canary checks.
+
+* Summary
+
+The Buddy system is a well-engineered virtual pet that:
+- Is deterministic and tamper-resistant (bones from hash, soul from LLM)
+- Has rich visual rendering (18 species × 6 eyes × 8 hats × 5 rarities)
+- Integrates deeply into the UI (sprite, speech bubbles, footer, input highlighting)
+- Teaches the LLM to defer to the companion when addressed
+- Was carefully rolled out with a teaser window and compile-time feature flag
