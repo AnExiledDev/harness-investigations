@@ -178,7 +178,7 @@ if __name__ == "__main__":
     p.add_argument(
         "--codex-reasoning-effort",
         choices=("low", "medium", "high", "xhigh"),
-        default=os.getenv("CHANGELOG_CODEX_REASONING_EFFORT") or "medium",
+        default=os.getenv("CHANGELOG_CODEX_REASONING_EFFORT") or "high",
     )
     p.add_argument(
         "--codex-bin",

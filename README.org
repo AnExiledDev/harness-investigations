@@ -116,9 +116,9 @@ Project definitions live in the =PROJECTS= dict near the top of =tools/sync.py=.
 
    #+begin_src bash
    CHANGELOG_AGENT_PROVIDER=codex
-   CHANGELOG_AGENT_MODEL=gpt-5.5
+   CHANGELOG_AGENT_MODEL=gpt-5.4
    CHANGELOG_ANNOTATION_MODEL=gpt-5.4-mini
-   CHANGELOG_CODEX_REASONING_EFFORT=medium
+   CHANGELOG_CODEX_REASONING_EFFORT=high
    CHANGELOG_CODEX_ANNOTATION_REASONING_EFFORT=low
    #+end_src
 

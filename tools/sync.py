@@ -3580,7 +3580,7 @@ Examples:
         or os.getenv("CHANGELOG_CHANGELOG_MODEL"),
         help=(
             "Model for final changelog generation. Defaults by provider "
-            "(claude: claude-sonnet-4-6, codex: gpt-5.5)."
+            "(claude: claude-sonnet-4-6, codex: gpt-5.4)."
         ),
     )
 
@@ -3595,9 +3595,9 @@ Examples:
 
     parser.add_argument(
         "--codex-reasoning-effort",
-        default=os.getenv("CHANGELOG_CODEX_REASONING_EFFORT") or "medium",
+        default=os.getenv("CHANGELOG_CODEX_REASONING_EFFORT") or "high",
         choices=["low", "medium", "high", "xhigh"],
-        help="Codex reasoning effort for final changelog generation. Default: medium",
+        help="Codex reasoning effort for final changelog generation. Default: high",
     )
 
     parser.add_argument(

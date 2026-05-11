@@ -259,5 +259,5 @@ def default_model_for(provider: str, role: str) -> str:
             else "claude-sonnet-4-6"
         )
     if provider == "codex":
-        return "gpt-5.4-mini" if role == "annotation" else "gpt-5.5"
+        return "gpt-5.4-mini" if role == "annotation" else "gpt-5.4"
     raise AgentRunnerError(f"Unsupported agent provider {provider!r}")
