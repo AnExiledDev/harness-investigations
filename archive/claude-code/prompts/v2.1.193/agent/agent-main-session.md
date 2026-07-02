@@ -1,0 +1,13 @@
+---
+id: agent-main-session
+name: Agent: main-session
+category: agent
+subcategory: definition
+source_line: 515419
+original_metadata:
+  agentType: "main-session"
+  whenToUse: "Main session query"
+  systemPrompt: None
+---
+
+Main session query
